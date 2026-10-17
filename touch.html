@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>noVNC タッチ</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  iframe { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; }
+  #mode {
+    position: fixed; top: 6px; right: 6px; z-index: 10; font: 13px sans-serif;
+    padding: 6px 10px; border-radius: 14px; border: 1px solid #888;
+    background: rgba(30,30,30,.7); color: #fff; opacity: .65;
+  }
+</style>
+</head>
+<body>
+<iframe id="f" title="remote desktop"></iframe>
+<button id="mode" type="button">…</button>
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var token = q.get('token') || '';
+  var port = q.get('tp') || '6081';
+  var frame = document.getElementById('f');
+  var btn = document.getElementById('mode');
+  var ws = null;
+  var mode = 'touch';
+  try { mode = localStorage.getItem('novnc-touch-mode') || 'touch'; } catch (e) {}
+
+  // noVNC の標準値（quality=6, compression=2）。試したいときは URL に &compression=4&quality=5 のように付ける
+  var vq = q.get('quality') || '6';
+  var vc = q.get('compression') || '2';
+  frame.src = 'vnc.html?resize=scale&autoconnect=1&reconnect=1&quality=' + encodeURIComponent(vq) +
+              '&compression=' + encodeURIComponent(vc);
+
+  function wsOpen() { return ws && ws.readyState === 1; }
+  function touchActive() { return mode === 'touch' && wsOpen(); }
+
+  function label() {
+    if (mode === 'mouse') btn.textContent = '🖱 マウス操作';
+    else btn.textContent = wsOpen() ? '👆 タッチ操作' : '⚠ タッチ未接続（マウス操作）';
+  }
+  btn.addEventListener('click', function () {
+    mode = mode === 'touch' ? 'mouse' : 'touch';
+    try { localStorage.setItem('novnc-touch-mode', mode); } catch (e) {}
+    label();
+  });
+
+  function connect() {
+    var url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.hostname + ':' + port +
+              '/?token=' + encodeURIComponent(token);
+    try { ws = new WebSocket(url); } catch (e) { setTimeout(connect, 3000); return; }
+    ws.onopen = label;
+    ws.onclose = function () { label(); setTimeout(connect, 2000); };
+    ws.onerror = function () {};
+  }
+  connect();
+  label();
+
+  function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+
+  function hook(doc) {
+    var own = {};           // 画面（canvas）で始まった指の id
+    var count = 0;
+    try { doc.documentElement.style.touchAction = 'none'; } catch (e) {}
+
+    function canvasOf(doc) {
+      return doc.querySelector('#noVNC_container canvas') || doc.querySelector('canvas');
+    }
+
+    function onTouch(ev) {
+      var canvas = canvasOf(doc);
+      if (!canvas) return;
+      var i, t;
+      if (ev.type === 'touchstart' && touchActive()) {
+        for (i = 0; i < ev.changedTouches.length; i++) {
+          t = ev.changedTouches[i];
+          if (t.target === canvas) { own[t.identifier] = true; count++; }
+        }
+      }
+      if (count === 0) return;
+
+      var r = canvas.getBoundingClientRect();
+      if (!r.width || !r.height) return;
+      var changed = {};
+      for (i = 0; i < ev.changedTouches.length; i++) changed[ev.changedTouches[i].identifier] = true;
+
+      var items = [];
+      for (i = 0; i < ev.touches.length; i++) {
+        t = ev.touches[i];
+        if (!own[t.identifier]) continue;
+        items.push({
+          id: t.identifier,
+          x: clamp01((t.clientX - r.left) / r.width),
+          y: clamp01((t.clientY - r.top) / r.height),
+          s: (ev.type === 'touchstart' && changed[t.identifier]) ? 'd' : 'm'
+        });
+      }
+      if (ev.type === 'touchend' || ev.type === 'touchcancel') {
+        for (i = 0; i < ev.changedTouches.length; i++) {
+          t = ev.changedTouches[i];
+          if (!own[t.identifier]) continue;
+          items.push({
+            id: t.identifier,
+            x: clamp01((t.clientX - r.left) / r.width),
+            y: clamp01((t.clientY - r.top) / r.height),
+            s: 'u'
+          });
+          delete own[t.identifier];
+          count--;
+        }
+      }
+      if (!items.length) return;
+      ev.preventDefault();
+      ev.stopImmediatePropagation();   // noVNC 側のマウス変換には渡さない
+      if (!wsOpen()) return;
+      // 動かすだけの更新は、送信待ちが溜まっているときは捨てる（古い位置を送り続けて遅れるのを防ぐ）
+      var onlyMoves = items.every(function (it) { return it.s === 'm'; });
+      if (onlyMoves && ws.bufferedAmount > 2048) return;
+      ws.send(JSON.stringify(items));
+    }
+
+    ['touchstart', 'touchmove', 'touchend', 'touchcancel'].forEach(function (n) {
+      doc.addEventListener(n, onTouch, { capture: true, passive: false });
+    });
+  }
+
+  frame.addEventListener('load', function () {
+    try { hook(frame.contentDocument); } catch (e) { btn.textContent = '⚠ ' + e.message; }
+  });
+})();
+</script>
+</body>
+</html>
